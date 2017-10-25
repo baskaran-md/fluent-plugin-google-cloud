@@ -42,6 +42,29 @@ class GoogleCloudOutputGRPCTest < Test::Unit::TestCase
     end
   end
 
+  def test_partial_success
+    setup_gce_metadata_stubs
+    {
+      APPLICATION_DEFAULT_CONFIG => 4.0,
+      PARTIAL_SUCCESS_CONFIG => 3.0
+    }.each do |config, failed_entry_count|
+      setup_prometheus
+      setup_logging_stubs(true, 7, 'User not authorized.',
+                          PARTIAL_SUCCESS_GRPC_METADATA) do
+        # The API Client should not retry this and the plugin should consume
+        # the exception.
+        d = create_driver(
+          USE_GRPC_CONFIG + PROMETHEUS_ENABLE_CONFIG + config, 'test')
+        4.times do |i|
+          d.emit('message' => log_entry(i.to_s))
+        end
+        d.run
+        assert_prometheus_metric_value(:stackdriver_dropped_entries_count,
+                                       failed_entry_count)
+      end
+    end
+  end
+
   def test_server_error
     setup_gce_metadata_stubs
     { 1 => 'Cancelled',
@@ -266,9 +289,10 @@ class GoogleCloudOutputGRPCTest < Test::Unit::TestCase
   # GRPC logging mock that fails and returns server side or client side errors.
   class GRPCLoggingMockFailingService <
       Google::Cloud::Logging::V2::LoggingServiceV2Client
-    def initialize(code, message, failed_attempts)
+    def initialize(code, message, metadata, failed_attempts)
       @code = code
       @message = message
+      @metadata = metadata
       @failed_attempts = failed_attempts
       super()
     end
@@ -283,7 +307,7 @@ class GoogleCloudOutputGRPCTest < Test::Unit::TestCase
                           options: nil)
       @failed_attempts << 1
       begin
-        raise GRPC::BadStatus.new_status_exception(@code, @message)
+        raise GRPC::BadStatus.new_status_exception(@code, @message, @metadata)
       rescue
         # Google::Gax::GaxError will wrap the latest thrown exception as @cause.
         raise Google::Gax::GaxError, @message
@@ -294,11 +318,14 @@ class GoogleCloudOutputGRPCTest < Test::Unit::TestCase
   end
 
   # Set up grpc stubs to mock the external calls.
-  def setup_logging_stubs(should_fail = false, code = nil, message = nil)
+  def setup_logging_stubs(should_fail = false,
+                          code = nil,
+                          message = nil,
+                          metadata = {})
     if should_fail
       @failed_attempts = []
       @grpc_stub = GRPCLoggingMockFailingService.new(
-        code, message, @failed_attempts)
+        code, message, metadata, @failed_attempts)
     else
       @requests_sent = []
       @grpc_stub = GRPCLoggingMockService.new(@requests_sent)
